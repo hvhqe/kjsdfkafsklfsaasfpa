@@ -1,0 +1,14 @@
+.env
+archiver.db
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+.idea/
+.vscode/
+.DS_Store
