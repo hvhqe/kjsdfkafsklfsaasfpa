@@ -1,9 +1,11 @@
 import asyncio
 import os
+import io
 import random
 import time
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Callable, Dict, Any, Awaitable
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -11,10 +13,13 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection,
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, TelegramObject
+    CallbackQuery, TelegramObject, BufferedInputFile
 )
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.utils.media_group import MediaGroupBuilder
+from PIL import Image, ImageDraw, ImageFont
+import google.generativeai as genai
+from deep_translator import GoogleTranslator
 from db import (
     init_db, save_message, get_message, get_media_group,
     update_message_text, upsert_connection,
@@ -25,7 +30,9 @@ from db import (
     upsert_user, get_user, get_user_by_username, get_all_users,
     count_users, set_ban, is_banned, get_all_user_ids,
     get_all_connected_owner_ids,
-    set_antimute, stop_antimute, is_antimute_enabled
+    set_antimute, stop_antimute, is_antimute_enabled,
+    set_swmute, remove_swmute, is_swmuted,
+    queue_swmute_delete, pop_swmute_queue
 )
 
 load_dotenv()
@@ -37,6 +44,7 @@ log = logging.getLogger("aimstar-save")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROXY = os.getenv("PROXY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_IDS = set()
 for x in os.getenv("ADMIN_IDS", "").split(","):
     x = x.strip()
@@ -45,6 +53,18 @@ for x in os.getenv("ADMIN_IDS", "").split(","):
 
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
+
+MSK = ZoneInfo("Europe/Moscow")
+
+if GEMINI_KEY:
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    except Exception as e:
+        log.warning(f"gemini init failed: {e}")
+        gemini_model = None
+else:
+    gemini_model = None
 
 
 if PROXY:
@@ -63,6 +83,26 @@ LAUGH_SYLLABLES = ["ха", "хы", "ах", "ых", "фа", "фы", "аф", "ыф
 
 LAUGH_ENDING = ["ХА", "ХАХ", "ХАХА", "ХАХАХ", "АХАХ"]
 
+MEMES = [
+    "https://i.imgflip.com/1bij.jpg",
+    "https://i.imgflip.com/1bip.jpg",
+    "https://i.imgflip.com/1bgw.jpg",
+    "https://i.imgflip.com/1bh3.jpg",
+    "https://i.imgflip.com/1bhf.jpg",
+    "https://i.imgflip.com/1bhm.jpg",
+    "https://i.imgflip.com/1bik.jpg",
+    "https://i.imgflip.com/26am.jpg",
+    "https://i.imgflip.com/1otk96.jpg",
+]
+
+LEET_MAP = {
+    "а": "4", "б": "6", "в": "8", "г": "9", "д": "d", "е": "3",
+    "з": "3", "и": "u", "к": "k", "л": "l", "м": "m", "н": "h",
+    "о": "0", "п": "n", "р": "p", "с": "s", "т": "7", "у": "y",
+    "ф": "f", "х": "x", "ц": "c", "ч": "4", "ш": "w", "щ": "w",
+    "ъ": "", "ы": "b", "ь": "", "э": "3", "ю": "10", "я": "9",
+}
+
 RIGHTS_LABELS = {
     "can_read_messages": "Читать сообщения",
     "can_reply": "Отвечать на сообщения",
@@ -70,9 +110,30 @@ RIGHTS_LABELS = {
     "can_delete_all_messages": "Удалять все сообщения",
 }
 
+SW_MAP = {
+    "q": "й", "w": "ц", "e": "у", "r": "к", "t": "е", "y": "н", "u": "г",
+    "i": "ш", "o": "щ", "p": "з", "[": "х", "]": "ъ", "a": "ф", "s": "ы",
+    "d": "в", "f": "а", "g": "п", "h": "р", "j": "о", "k": "л", "l": "д",
+    ";": "ж", "'": "э", "z": "я", "x": "ч", "c": "с", "v": "м", "b": "и",
+    "n": "т", "m": "ь", ",": "б", ".": "ю",
+    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y", "г": "u",
+    "ш": "i", "щ": "o", "з": "p", "х": "[", "ъ": "]", "ф": "a", "ы": "s",
+    "в": "d", "а": "f", "п": "g", "р": "h", "о": "j", "л": "k", "д": "l",
+    "ж": ";", "э": "'", "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b",
+    "т": "n", "ь": "m", "б": ",", "ю": ".",
+}
+
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
+
+
+def to_leet(text: str) -> str:
+    return "".join(LEET_MAP.get(ch, ch) for ch in text.lower())
+
+
+def to_sw(text: str) -> str:
+    return "".join(SW_MAP.get(ch, ch) for ch in text)
 
 
 async def is_subscribed(uid: int) -> bool:
@@ -303,16 +364,35 @@ async def send_saved(owner_id: int, row, title="Удалённое сообще�
         log.exception(f"send_saved failed: {e}")
 
 
-async def send_as_owner(conn_id: str, chat_id: int, text: str) -> bool:
+async def send_as_owner(conn_id: str, chat_id: int, text: str, parse_mode: str = None) -> bool:
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            business_connection_id=conn_id
-        )
+        kwargs = {
+            "chat_id": chat_id,
+            "text": text,
+            "business_connection_id": conn_id,
+        }
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        await bot.send_message(**kwargs)
         return True
     except Exception as e:
         log.exception(f"send_as_owner failed: {e}")
+        return False
+
+
+async def send_photo_as_owner(conn_id: str, chat_id: int, photo, caption: str = None):
+    try:
+        kwargs = {
+            "chat_id": chat_id,
+            "photo": photo,
+            "business_connection_id": conn_id,
+        }
+        if caption:
+            kwargs["caption"] = caption
+        await bot.send_photo(**kwargs)
+        return True
+    except Exception as e:
+        log.exception(f"send_photo_as_owner failed: {e}")
         return False
 
 
@@ -356,6 +436,13 @@ async def delete_msg_as_owner(conn_id: str, chat_id: int, message_id: int):
             log.warning(f"delete_message fallback failed: {e2}")
 
 
+async def download_photo_as_bytes(file_id: str) -> bytes:
+    file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, buf)
+    return buf.getvalue()
+
+
 async def mute_watcher():
     while True:
         try:
@@ -381,6 +468,31 @@ async def mute_watcher():
         except Exception as e:
             log.exception(f"mute_watcher error: {e}")
         await asyncio.sleep(3)
+
+
+async def swmute_watcher():
+    while True:
+        try:
+            batch = await pop_swmute_queue()
+            if batch:
+                grouped: dict = {}
+                for item in batch:
+                    key = (item["conn_id"], item["chat_id"])
+                    grouped.setdefault(key, []).append(item["message_id"])
+
+                for (conn_id, chat_id), ids in grouped.items():
+                    for i in range(0, len(ids), 100):
+                        chunk = ids[i:i+100]
+                        try:
+                            await bot.delete_business_messages(
+                                business_connection_id=conn_id,
+                                message_ids=chunk
+                            )
+                        except Exception as e:
+                            log.warning(f"swmute batch delete failed: {e}")
+        except Exception as e:
+            log.exception(f"swmute_watcher error: {e}")
+        await asyncio.sleep(0.3)
 
 
 @dp.message(Command("start"))
@@ -497,7 +609,7 @@ async def menu_profile(msg: Message):
     connected = await is_connected(uid)
     conns = await get_connections_for_owner(uid)
     first_date = await get_first_connection_date(uid)
-    dt = datetime.fromtimestamp(first_date).strftime("%d.%m.%Y %H:%M") if first_date else "—"
+    dt = datetime.fromtimestamp(first_date, MSK).strftime("%d.%m.%Y %H:%M") if first_date else "—"
 
     rights_line = ""
     if conns:
@@ -542,30 +654,62 @@ async def menu_help(msg: Message):
 
     base_text = (
         "*Помощь*\n\n"
-        "*Команды в личке с ботом:*\n"
+        "*В личке с ботом:*\n"
         "`/auto <текст>` — включить автоответчик\n"
         "`/autostop` — выключить автоответчик\n"
-        "`/autostatus` — проверить статус автоответчика\n\n"
-        "*Команды в чатах с собеседниками:*\n"
-        "`.haha [n]` — n сообщений пк-смеха (по умолчанию 5, максимум 20)\n\n"
-        "`.spam [n] [текст]` — n раз отправить твой текст\n\n"
-        "`.dice` — кинуть кубик от твоего имени\n\n"
-        "`.img` — ответь на медиа, копия придёт тебе в личку\n\n"
-        "`.mute [срок]` — замутить собеседника (30s, 5m, 1h, 2d, 1w)\n\n"
-        "`.unmute` — снять мут\n\n"
-        "`.antimute` — вкл/выкл дублирование своих сообщений"
+        "`/autostatus` — статус автоответчика\n\n"
+        "*В чатах с собеседниками:*\n"
+        "*Спам:*\n"
+        "`.haha [n]` — n сообщений пк-смеха\n"
+        "`.spam [n] [текст]` — n раз текст\n"
+        "`.flood <текст>` — каждое слово отдельно\n"
+        "`.type <текст>` — по одному слову с задержкой\n\n"
+        "*Текст:*\n"
+        "`.rev <текст>` — задом наперёд\n"
+        "`.leet <текст>` — l33t\n"
+        "`.sw <текст>` — смена раскладки\n"
+        "`.bold <текст>` — *жирный*\n"
+        "`.italic <текст>` — _курсив_\n"
+        "`.mono <текст>` — `моноширинный`\n"
+        "`.line <текст>` — подчёркнутый\n"
+        "`.crossed <текст>` — зачёркнутый\n"
+        "`.hidden <текст>` — скрытый\n"
+        "`.quote <текст>` — цитата\n"
+        "`.code <текст>` — блок кода\n\n"
+        "*Утилиты:*\n"
+        "`.ai <вопрос>` — спросить Gemini\n"
+        "`.tl <текст>` — перевести на русский\n"
+        "`.short <url>` — сократить ссылку\n"
+        "`.info` — инфо о собеседнике\n\n"
+        "*Игры:*\n"
+        "`.rps` — камень-ножницы-бумага\n"
+        "`.flip` — орёл/решка\n"
+        "`.duel` — дуэль\n"
+        "`.xox` — крестики-нолики\n"
+        "`.streak` — серия\n\n"
+        "*Медиа:*\n"
+        "`.meme` — случайный мем\n"
+        "`.wtm <текст>` — водяной знак (ответь на фото)\n"
+        "`.memz <текст>` — чёрные поля с текстом (ответь на фото)\n\n"
+        "*Модерация:*\n"
+        "`.mute [срок]` — мут на время\n"
+        "`.swmute` — постоянный мут\n"
+        "`.unmute` — снять мут\n"
+        "`.antimute` — дублирование своих сообщений\n"
+        "`.dice` — кубик\n"
+        "`.img` — копия медиа в личку"
     )
 
     if is_admin(uid):
         base_text += (
             "\n\n*Админ-команды:*\n"
-            "`/stats` — статистика бота\n"
+            "`/stats` — статистика\n"
             "`/users` — список юзеров\n"
-            "`/user <id|@username>` — инфо по юзеру\n"
+            "`/user <id|@username>` — инфо\n"
             "`/ban <id|@username> [причина]` — забанить\n"
             "`/unban <id|@username>` — разбанить\n"
-            "`/bans` — список забаненных\n"
-            "`/broadcast <текст>` — рассылка всем"
+            "`/bans` — забаненные\n"
+            "`/broadcast <текст>` — рассылка"
         )
 
     await msg.answer(
@@ -594,6 +738,7 @@ async def cb_unmute(cb: CallbackQuery):
     card_id = mute["card_message_id"] if "card_message_id" in mute.keys() else None
 
     await remove_mute(uid, chat_id)
+    await remove_swmute(uid, chat_id)
     await cb.answer("Мут снят", show_alert=True)
 
     if card_id:
@@ -729,8 +874,8 @@ async def cmd_user(msg: Message, command: CommandObject):
         f"Забанен: `{'да' if u['is_banned'] else 'нет'}`\n"
         f"Причина бана: {u['ban_reason'] or '—'}\n"
         f"Активных подключений: `{len(conns)}`\n"
-        f"Первый визит: `{datetime.fromtimestamp(u['first_seen']).strftime('%d.%m.%Y %H:%M')}`\n"
-        f"Последний визит: `{datetime.fromtimestamp(u['last_seen']).strftime('%d.%m.%Y %H:%M')}`",
+        f"Первый визит: `{datetime.fromtimestamp(u['first_seen'], MSK).strftime('%d.%m.%Y %H:%M')}`\n"
+        f"Последний визит: `{datetime.fromtimestamp(u['last_seen'], MSK).strftime('%d.%m.%Y %H:%M')}`",
         parse_mode="Markdown"
     )
 
@@ -900,6 +1045,10 @@ async def on_business_message(msg: Message):
         return
 
     if not is_outgoing:
+        if await is_swmuted(owner_id, msg.chat.id):
+            await queue_swmute_delete(owner_id, msg.chat.id, msg.message_id, conn_id)
+            return
+
         mute = await get_mute(owner_id, msg.chat.id)
         if mute:
             if mute["until"] <= int(time.time()):
@@ -931,6 +1080,8 @@ async def on_business_message(msg: Message):
 async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: int):
     parts = text.split(maxsplit=2)
     cmd = parts[0].lower()
+
+    # ---------- спам ----------
 
     if cmd == ".haha":
         n = 5
@@ -965,6 +1116,310 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
                 break
             await asyncio.sleep(0.15)
         return
+
+    if cmd == ".flood":
+        arg = text[len(".flood"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        for w in arg.split():
+            ok = await send_as_owner(conn_id, msg.chat.id, w)
+            if not ok:
+                break
+            await asyncio.sleep(0.15)
+        return
+
+    if cmd == ".type":
+        arg = text[len(".type"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        for w in arg.split():
+            ok = await send_as_owner(conn_id, msg.chat.id, w)
+            if not ok:
+                break
+            await asyncio.sleep(0.7)
+        return
+
+    # ---------- текст ----------
+
+    if cmd == ".rev":
+        arg = text[len(".rev"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, arg[::-1])
+        return
+
+    if cmd == ".leet":
+        arg = text[len(".leet"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, to_leet(arg))
+        return
+
+    if cmd == ".sw":
+        arg = text[len(".sw"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, to_sw(arg))
+        return
+
+    if cmd == ".bold":
+        arg = text[len(".bold"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"*{arg}*", parse_mode="Markdown")
+        return
+
+    if cmd == ".italic":
+        arg = text[len(".italic"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"_{arg}_", parse_mode="Markdown")
+        return
+
+    if cmd == ".mono":
+        arg = text[len(".mono"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"`{arg}`", parse_mode="Markdown")
+        return
+
+    if cmd == ".line":
+        arg = text[len(".line"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"__{arg}__", parse_mode="Markdown")
+        return
+
+    if cmd == ".crossed":
+        arg = text[len(".crossed"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"~{arg}~", parse_mode="Markdown")
+        return
+
+    if cmd == ".hidden":
+        arg = text[len(".hidden"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"||{arg}||", parse_mode="Markdown")
+        return
+
+    if cmd == ".quote":
+        arg = text[len(".quote"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"> {arg}", parse_mode="Markdown")
+        return
+
+    if cmd == ".code":
+        arg = text[len(".code"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        await send_as_owner(conn_id, msg.chat.id, f"```\n{arg}\n```", parse_mode="Markdown")
+        return
+
+    # ---------- утилиты ----------
+
+    if cmd == ".ai":
+        arg = text[len(".ai"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        if not gemini_model:
+            await bot.send_message(owner_id, "Gemini не настроен (нет GEMINI_API_KEY).")
+            return
+        try:
+            resp = await asyncio.to_thread(gemini_model.generate_content, arg)
+            answer = (resp.text or "").strip()
+            if not answer:
+                answer = "(пусто)"
+            if len(answer) > 4000:
+                answer = answer[:4000] + "..."
+            await send_as_owner(conn_id, msg.chat.id, answer)
+        except Exception as e:
+            log.exception(f".ai failed: {e}")
+            await bot.send_message(owner_id, f"Ошибка Gemini: {e}")
+        return
+
+    if cmd == ".tl":
+        arg = text[len(".tl"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        try:
+            translated = await asyncio.to_thread(
+                GoogleTranslator(source="auto", target="ru").translate, arg
+            )
+            await send_as_owner(conn_id, msg.chat.id, translated)
+        except Exception as e:
+            log.exception(f".tl failed: {e}")
+            await bot.send_message(owner_id, f"Ошибка перевода: {e}")
+        return
+
+    if cmd == ".short":
+        arg = text[len(".short"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not arg:
+            return
+        try:
+            import urllib.parse
+            import urllib.request
+            url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(arg)}"
+            with urllib.request.urlopen(url, timeout=5) as r:
+                short = r.read().decode()
+            await send_as_owner(conn_id, msg.chat.id, short)
+        except Exception as e:
+            log.exception(f".short failed: {e}")
+            await bot.send_message(owner_id, f"Ошибка сокращения: {e}")
+        return
+
+    if cmd == ".info":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        peer_name = msg.chat.full_name or msg.chat.title or "—"
+        peer_username = f"@{msg.chat.username}" if msg.chat.username else "—"
+        peer_id = msg.chat.id
+        text_out = (
+            f"Инфо о собеседнике:\n"
+            f"ID: {peer_id}\n"
+            f"Имя: {peer_name}\n"
+            f"Username: {peer_username}"
+        )
+        await bot.send_message(owner_id, text_out)
+        return
+
+    # ---------- игры ----------
+
+    if cmd == ".rps":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        choice = random.choice(["камень", "ножницы", "бумага"])
+        await send_as_owner(conn_id, msg.chat.id, f"🪨✂️📄 {choice}")
+        return
+
+    if cmd == ".flip":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        result = random.choice(["орёл", "решка"])
+        await send_as_owner(conn_id, msg.chat.id, f"🪙 {result}")
+        return
+
+    if cmd == ".duel":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        result = random.choice([
+            "ты выжил. противник убит",
+            "ты убит. противник выжил",
+            "оба выжили",
+            "оба убиты",
+        ])
+        await send_as_owner(conn_id, msg.chat.id, f"🔫 {result}")
+        return
+
+    if cmd == ".xox":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        result = random.choice(["X победил", "O победил", "ничья"])
+        await send_as_owner(conn_id, msg.chat.id, f"❌⭕ {result}")
+        return
+
+    if cmd == ".streak":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        n = random.randint(1, 100)
+        await send_as_owner(conn_id, msg.chat.id, f"🔥 серия: {n}")
+        return
+
+    # ---------- медиа ----------
+
+    if cmd == ".meme":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        try:
+            url = random.choice(MEMES)
+            await bot.send_photo(
+                chat_id=msg.chat.id,
+                photo=url,
+                business_connection_id=conn_id
+            )
+        except Exception as e:
+            log.exception(f"meme failed: {e}")
+        return
+
+    if cmd == ".wtm":
+        arg = text[len(".wtm"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not msg.reply_to_message or not msg.reply_to_message.photo:
+            await bot.send_message(owner_id, "Ответь на фото командой .wtm <текст>")
+            return
+        if not arg:
+            return
+        try:
+            raw = await download_photo_as_bytes(msg.reply_to_message.photo[-1].file_id)
+            img = Image.open(io.BytesIO(raw)).convert("RGBA")
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(20, img.width // 20))
+            except Exception:
+                font = ImageFont.load_default()
+            w, h = img.size
+            bbox = draw.textbbox((0, 0), arg, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            x = w - tw - 20
+            y = h - th - 30
+            draw.text((x+2, y+2), arg, font=font, fill=(0, 0, 0, 200))
+            draw.text((x, y), arg, font=font, fill=(255, 255, 255, 255))
+            out = io.BytesIO()
+            img.convert("RGB").save(out, format="JPEG", quality=85)
+            out.seek(0)
+            file = BufferedInputFile(out.read(), filename="wtm.jpg")
+            await send_photo_as_owner(conn_id, msg.chat.id, file)
+        except Exception as e:
+            log.exception(f".wtm failed: {e}")
+            await bot.send_message(owner_id, f"Ошибка .wtm: {e}")
+        return
+
+    if cmd == ".memz":
+        arg = text[len(".memz"):].strip()
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if not msg.reply_to_message or not msg.reply_to_message.photo:
+            await bot.send_message(owner_id, "Ответь на фото командой .memz <текст>")
+            return
+        try:
+            raw = await download_photo_as_bytes(msg.reply_to_message.photo[-1].file_id)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            try:
+                font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(24, img.width // 15))
+            except Exception:
+                font = ImageFont.load_default()
+            bbox = ImageDraw.Draw(img).textbbox((0, 0), arg or " ", font=font)
+            th = bbox[3] - bbox[1]
+            pad = th + 40
+            new = Image.new("RGB", (img.width, img.height + pad * 2), (0, 0, 0))
+            new.paste(img, (0, pad))
+            draw = ImageDraw.Draw(new)
+            if arg:
+                bbox2 = draw.textbbox((0, 0), arg, font=font)
+                tw = bbox2[2] - bbox2[0]
+                draw.text(((img.width - tw) // 2, 10), arg, font=font, fill=(255, 255, 255))
+            out = io.BytesIO()
+            new.save(out, format="JPEG", quality=85)
+            out.seek(0)
+            file = BufferedInputFile(out.read(), filename="memz.jpg")
+            await send_photo_as_owner(conn_id, msg.chat.id, file)
+        except Exception as e:
+            log.exception(f".memz failed: {e}")
+            await bot.send_message(owner_id, f"Ошибка .memz: {e}")
+        return
+
+    # ---------- модерация ----------
 
     if cmd == ".dice":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
@@ -1046,6 +1501,19 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
         log.info(f".mute [{owner_id}] chat={msg.chat.id} secs={secs} card={card_id}")
         return
 
+    if cmd == ".swmute":
+        await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
+        if await is_swmuted(owner_id, msg.chat.id):
+            await remove_swmute(owner_id, msg.chat.id)
+            await send_as_owner(conn_id, msg.chat.id, "Постоянный мут снят.")
+        else:
+            await set_swmute(owner_id, msg.chat.id)
+            await send_as_owner(
+                conn_id, msg.chat.id,
+                "Вам выдан постоянный мут.\nВы не можете писать в чат!\n\nЛучший бот: @aimstarsavebot"
+            )
+        return
+
     if cmd == ".unmute":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         mute = await get_mute(owner_id, msg.chat.id)
@@ -1053,6 +1521,7 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
         if mute and "card_message_id" in mute.keys():
             card_id = mute["card_message_id"]
         await remove_mute(owner_id, msg.chat.id)
+        await remove_swmute(owner_id, msg.chat.id)
         if card_id:
             try:
                 await bot.delete_business_messages(
@@ -1098,17 +1567,24 @@ async def on_edited_business_message(msg: Message):
     await update_message_text(msg.chat.id, msg.message_id, new_text)
     await bump_stat(owner_id, msg.chat.id, "edited_count")
 
+    editor = msg.from_user
+    if editor:
+        username = f"@{editor.username}" if editor.username else editor.full_name
+        editor_id = editor.id
+    else:
+        username = "unknown"
+        editor_id = "—"
+
     header = (
-        f"*Сообщение отредактировано*\n"
-        f"Чат: `{msg.chat.id}`\n"
-        f"ID: `{msg.message_id}`"
+        f"{username} ({editor_id})\n"
+        f"отредактировал свое сообщение\n"
+        f"было:\n"
+        f"{old_text}\n\n"
+        f"стало:\n"
+        f"{new_text}"
     )
     try:
-        await bot.send_message(
-            owner_id,
-            header + f"\n\n*Было:*\n{old_text}\n\n*Стало:*\n{new_text}",
-            parse_mode="Markdown"
-        )
+        await bot.send_message(owner_id, header)
     except Exception as e:
         log.exception(f"failed to notify edit: {e}")
 
@@ -1182,6 +1658,7 @@ async def main():
     dp.callback_query.middleware(SubscriptionMiddleware())
 
     asyncio.create_task(mute_watcher())
+    asyncio.create_task(swmute_watcher())
 
     await dp.start_polling(bot)
 

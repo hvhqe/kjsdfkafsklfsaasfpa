@@ -1,8 +1,9 @@
 import aiosqlite
 import time
+import os
 from pathlib import Path
 
-DB_PATH = Path("archiver.db")
+DB_PATH = Path(os.getenv("DB_PATH", "archiver.db"))
 
 
 async def init_db():
@@ -67,6 +68,25 @@ async def init_db():
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS swmutes (
+                owner_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (owner_id, chat_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS swmute_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                conn_id TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 owner_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
@@ -96,14 +116,6 @@ async def init_db():
                 last_seen INTEGER DEFAULT (strftime('%s', 'now')),
                 is_banned INTEGER DEFAULT 0,
                 ban_reason TEXT
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_langs (
-                user_id INTEGER PRIMARY KEY,
-                lang TEXT DEFAULT 'ru',
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
             )
         """)
 
@@ -272,6 +284,53 @@ async def is_antimute_enabled(owner_id: int) -> bool:
             return bool(row)
 
 
+async def set_swmute(owner_id: int, chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO swmutes (owner_id, chat_id) VALUES (?, ?)",
+            (owner_id, chat_id)
+        )
+        await db.commit()
+
+
+async def remove_swmute(owner_id: int, chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM swmutes WHERE owner_id = ? AND chat_id = ?",
+            (owner_id, chat_id)
+        )
+        await db.commit()
+
+
+async def is_swmuted(owner_id: int, chat_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM swmutes WHERE owner_id = ? AND chat_id = ?",
+            (owner_id, chat_id)
+        ) as cur:
+            return bool(await cur.fetchone())
+
+
+async def queue_swmute_delete(owner_id: int, chat_id: int, message_id: int, conn_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO swmute_queue (owner_id, chat_id, message_id, conn_id)
+            VALUES (?, ?, ?, ?)
+        """, (owner_id, chat_id, message_id, conn_id))
+        await db.commit()
+
+
+async def pop_swmute_queue():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM swmute_queue") as cur:
+            rows = await cur.fetchall()
+        if rows:
+            await db.execute("DELETE FROM swmute_queue")
+            await db.commit()
+    return [dict(r) for r in rows]
+
+
 async def bump_stat(owner_id: int, chat_id: int, field: str):
     if field not in ("deleted_count", "edited_count"):
         return
@@ -415,24 +474,3 @@ async def get_all_user_ids():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cur:
             return [r[0] for r in await cur.fetchall()]
-
-
-async def set_user_lang(user_id: int, lang: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO user_langs (user_id, lang)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                lang = excluded.lang,
-                updated_at = strftime('%s', 'now')
-        """, (user_id, lang))
-        await db.commit()
-
-
-async def get_user_lang(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT lang FROM user_langs WHERE user_id = ?", (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else "ru"
