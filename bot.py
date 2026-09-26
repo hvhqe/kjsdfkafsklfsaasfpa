@@ -59,7 +59,7 @@ MSK = ZoneInfo("Europe/Moscow")
 if GEMINI_KEY:
     try:
         genai.configure(api_key=GEMINI_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        gemini_model = genai.GenerativeModel("gemini-flash-latest")
     except Exception as e:
         log.warning(f"gemini init failed: {e}")
         gemini_model = None
