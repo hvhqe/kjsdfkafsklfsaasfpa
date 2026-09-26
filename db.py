@@ -71,6 +71,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS swmutes (
                 owner_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
+                card_message_id INTEGER,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 PRIMARY KEY (owner_id, chat_id)
             )
@@ -83,6 +84,15 @@ async def init_db():
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 conn_id TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                owner_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                first_message_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_id, chat_id)
             )
         """)
 
@@ -221,6 +231,27 @@ async def get_all_connected_owner_ids():
             return {r[0] for r in await cur.fetchall()}
 
 
+async def register_chat(owner_id: int, chat_id: int, ts: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO chats (owner_id, chat_id, first_message_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_id, chat_id) DO UPDATE SET
+                first_message_at = MIN(first_message_at, excluded.first_message_at)
+        """, (owner_id, chat_id, ts))
+        await db.commit()
+
+
+async def get_chat_start(owner_id: int, chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT first_message_at FROM chats WHERE owner_id = ? AND chat_id = ?",
+            (owner_id, chat_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
 async def set_auto_reply(owner_id: int, text: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -284,12 +315,14 @@ async def is_antimute_enabled(owner_id: int) -> bool:
             return bool(row)
 
 
-async def set_swmute(owner_id: int, chat_id: int):
+async def set_swmute(owner_id: int, chat_id: int, card_message_id: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO swmutes (owner_id, chat_id) VALUES (?, ?)",
-            (owner_id, chat_id)
-        )
+        await db.execute("""
+            INSERT INTO swmutes (owner_id, chat_id, card_message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_id, chat_id) DO UPDATE SET
+                card_message_id = excluded.card_message_id
+        """, (owner_id, chat_id, card_message_id))
         await db.commit()
 
 
@@ -300,6 +333,16 @@ async def remove_swmute(owner_id: int, chat_id: int):
             (owner_id, chat_id)
         )
         await db.commit()
+
+
+async def get_swmute(owner_id: int, chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM swmutes WHERE owner_id = ? AND chat_id = ?",
+            (owner_id, chat_id)
+        ) as cur:
+            return await cur.fetchone()
 
 
 async def is_swmuted(owner_id: int, chat_id: int) -> bool:

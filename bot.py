@@ -18,7 +18,7 @@ from aiogram.types import (
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.utils.media_group import MediaGroupBuilder
 from PIL import Image, ImageDraw, ImageFont
-import google.generativeai as genai
+from google import genai
 from deep_translator import GoogleTranslator
 from db import (
     init_db, save_message, get_message, get_media_group,
@@ -31,8 +31,9 @@ from db import (
     count_users, set_ban, is_banned, get_all_user_ids,
     get_all_connected_owner_ids,
     set_antimute, stop_antimute, is_antimute_enabled,
-    set_swmute, remove_swmute, is_swmuted,
-    queue_swmute_delete, pop_swmute_queue
+    set_swmute, remove_swmute, get_swmute, is_swmuted,
+    queue_swmute_delete, pop_swmute_queue,
+    register_chat, get_chat_start
 )
 
 load_dotenv()
@@ -56,15 +57,13 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 
 MSK = ZoneInfo("Europe/Moscow")
 
+gemini_client = None
 if GEMINI_KEY:
     try:
-        genai.configure(api_key=GEMINI_KEY)
-        gemini_model = genai.GenerativeModel("gemini-flash-latest")
+        gemini_client = genai.Client(api_key=GEMINI_KEY)
     except Exception as e:
         log.warning(f"gemini init failed: {e}")
-        gemini_model = None
-else:
-    gemini_model = None
+        gemini_client = None
 
 
 if PROXY:
@@ -422,6 +421,31 @@ async def send_mute_card(conn_id: str, chat_id: int, secs: int):
         return None
 
 
+async def send_swmute_card(conn_id: str, chat_id: int):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔴 Размутить",
+            callback_data=f"unmute:{chat_id}"
+        )]
+    ])
+    text = (
+        f"Вам выдан постоянный мут.\n"
+        f"Вы не можете писать в чат!\n\n"
+        f"Лучший бот: @aimstarsavebot"
+    )
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            business_connection_id=conn_id,
+            reply_markup=kb
+        )
+        return sent.message_id
+    except Exception as e:
+        log.exception(f"send_swmute_card failed: {e}")
+        return None
+
+
 async def delete_msg_as_owner(conn_id: str, chat_id: int, message_id: int):
     try:
         await bot.delete_business_messages(
@@ -668,9 +692,9 @@ async def menu_help(msg: Message):
         "`.rev <текст>` — задом наперёд\n"
         "`.leet <текст>` — l33t\n"
         "`.sw <текст>` — смена раскладки\n"
-        "`.bold <текст>` — *жирный*\n"
-        "`.italic <текст>` — _курсив_\n"
-        "`.mono <текст>` — `моноширинный`\n"
+        "`.bold <текст>` — жирный\n"
+        "`.italic <текст>` — курсив\n"
+        "`.mono <текст>` — моно\n"
         "`.line <текст>` — подчёркнутый\n"
         "`.crossed <текст>` — зачёркнутый\n"
         "`.hidden <текст>` — скрытый\n"
@@ -686,7 +710,7 @@ async def menu_help(msg: Message):
         "`.flip` — орёл/решка\n"
         "`.duel` — дуэль\n"
         "`.xox` — крестики-нолики\n"
-        "`.streak` — серия\n\n"
+        "`.streak` — серия (дней с первого сообщения)\n\n"
         "*Медиа:*\n"
         "`.meme` — случайный мем\n"
         "`.wtm <текст>` — водяной знак (ответь на фото)\n"
@@ -730,12 +754,19 @@ async def cb_unmute(cb: CallbackQuery):
         return
 
     conn_id = conns[0]["conn_id"]
+
     mute = await get_mute(uid, chat_id)
-    if not mute:
+    swmute = await get_swmute(uid, chat_id)
+
+    if not mute and not swmute:
         await cb.answer("Мут уже снят или недействителен", show_alert=True)
         return
 
-    card_id = mute["card_message_id"] if "card_message_id" in mute.keys() else None
+    card_id = None
+    if mute and "card_message_id" in mute.keys():
+        card_id = mute["card_message_id"]
+    if swmute and "card_message_id" in swmute.keys() and swmute["card_message_id"]:
+        card_id = swmute["card_message_id"]
 
     await remove_mute(uid, chat_id)
     await remove_swmute(uid, chat_id)
@@ -1073,6 +1104,8 @@ async def on_business_message(msg: Message):
     if (not is_outgoing) and msg.has_protected_content:
         return
 
+    await register_chat(owner_id, msg.chat.id, int(msg.date.timestamp()))
+
     data = extract_msg_data(msg, conn_id, owner_id)
     await save_message(data)
 
@@ -1080,8 +1113,6 @@ async def on_business_message(msg: Message):
 async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: int):
     parts = text.split(maxsplit=2)
     cmd = parts[0].lower()
-
-    # ---------- спам ----------
 
     if cmd == ".haha":
         n = 5
@@ -1140,8 +1171,6 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
                 break
             await asyncio.sleep(0.7)
         return
-
-    # ---------- текст ----------
 
     if cmd == ".rev":
         arg = text[len(".rev"):].strip()
@@ -1231,18 +1260,21 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
         await send_as_owner(conn_id, msg.chat.id, f"```\n{arg}\n```", parse_mode="Markdown")
         return
 
-    # ---------- утилиты ----------
-
     if cmd == ".ai":
         arg = text[len(".ai"):].strip()
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         if not arg:
             return
-        if not gemini_model:
+        if not gemini_client:
             await bot.send_message(owner_id, "Gemini не настроен (нет GEMINI_API_KEY).")
             return
         try:
-            resp = await asyncio.to_thread(gemini_model.generate_content, arg)
+            def _gen():
+                return gemini_client.models.generate_content(
+                    model="gemini-flash-latest",
+                    contents=arg
+                )
+            resp = await asyncio.to_thread(_gen)
             answer = (resp.text or "").strip()
             if not answer:
                 answer = "(пусто)"
@@ -1300,18 +1332,16 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
         await bot.send_message(owner_id, text_out)
         return
 
-    # ---------- игры ----------
-
     if cmd == ".rps":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         choice = random.choice(["камень", "ножницы", "бумага"])
-        await send_as_owner(conn_id, msg.chat.id, f"🪨✂️📄 {choice}")
+        await send_as_owner(conn_id, msg.chat.id, f"{choice}")
         return
 
     if cmd == ".flip":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         result = random.choice(["орёл", "решка"])
-        await send_as_owner(conn_id, msg.chat.id, f"🪙 {result}")
+        await send_as_owner(conn_id, msg.chat.id, f"{result}")
         return
 
     if cmd == ".duel":
@@ -1322,22 +1352,33 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
             "оба выжили",
             "оба убиты",
         ])
-        await send_as_owner(conn_id, msg.chat.id, f"🔫 {result}")
+        await send_as_owner(conn_id, msg.chat.id, f"{result}")
         return
 
     if cmd == ".xox":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         result = random.choice(["X победил", "O победил", "ничья"])
-        await send_as_owner(conn_id, msg.chat.id, f"❌⭕ {result}")
+        await send_as_owner(conn_id, msg.chat.id, f"{result}")
         return
 
     if cmd == ".streak":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
-        n = random.randint(1, 100)
-        await send_as_owner(conn_id, msg.chat.id, f"🔥 серия: {n}")
+        start_ts = await get_chat_start(owner_id, msg.chat.id)
+        if not start_ts:
+            start_ts = int(time.time())
+            await register_chat(owner_id, msg.chat.id, start_ts)
+        delta = int(time.time()) - start_ts
+        days = delta // 86400
+        hours = (delta % 86400) // 3600
+        minutes = (delta % 3600) // 60
+        if days > 0:
+            out = f"Серия: {days} дн. {hours} ч."
+        elif hours > 0:
+            out = f"Серия: {hours} ч. {minutes} мин."
+        else:
+            out = f"Серия: {minutes} мин."
+        await send_as_owner(conn_id, msg.chat.id, out)
         return
-
-    # ---------- медиа ----------
 
     if cmd == ".meme":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
@@ -1418,8 +1459,6 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
             log.exception(f".memz failed: {e}")
             await bot.send_message(owner_id, f"Ошибка .memz: {e}")
         return
-
-    # ---------- модерация ----------
 
     if cmd == ".dice":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
@@ -1507,19 +1546,19 @@ async def handle_dot_command(msg: Message, text: str, conn_id: str, owner_id: in
             await remove_swmute(owner_id, msg.chat.id)
             await send_as_owner(conn_id, msg.chat.id, "Постоянный мут снят.")
         else:
-            await set_swmute(owner_id, msg.chat.id)
-            await send_as_owner(
-                conn_id, msg.chat.id,
-                "Вам выдан постоянный мут.\nВы не можете писать в чат!\n\nЛучший бот: @aimstarsavebot"
-            )
+            card_id = await send_swmute_card(conn_id, msg.chat.id)
+            await set_swmute(owner_id, msg.chat.id, card_id)
         return
 
     if cmd == ".unmute":
         await delete_msg_as_owner(conn_id, msg.chat.id, msg.message_id)
         mute = await get_mute(owner_id, msg.chat.id)
+        swmute = await get_swmute(owner_id, msg.chat.id)
         card_id = None
         if mute and "card_message_id" in mute.keys():
             card_id = mute["card_message_id"]
+        if swmute and "card_message_id" in swmute.keys() and swmute["card_message_id"]:
+            card_id = swmute["card_message_id"]
         await remove_mute(owner_id, msg.chat.id)
         await remove_swmute(owner_id, msg.chat.id)
         if card_id:
